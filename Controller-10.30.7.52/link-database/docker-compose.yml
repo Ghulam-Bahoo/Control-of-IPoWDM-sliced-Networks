@@ -1,0 +1,39 @@
+# docker-compose.yml for Link Database
+version: '3.8'
+
+services:
+  link-database:
+    build: .
+    container_name: link-database
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKER=10.30.7.52:9092
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - ipowdm-network
+    volumes:
+      - ./link_database:/app/link_database  # For development: mount local code
+
+  redis:
+    image: redis:7-alpine
+    container_name: link-db-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - ipowdm-network
+
+volumes:
+  redis-data:
+
+networks:
+  ipowdm-network:
+    driver: bridge

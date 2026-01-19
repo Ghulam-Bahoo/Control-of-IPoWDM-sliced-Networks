@@ -1,0 +1,8 @@
+kafka-python==2.0.2
+pydantic==1.10.14
+python-dotenv==1.0.0
+structlog==23.1.0
+tenacity==8.2.3
+psutil==5.9.6
+prometheus-client==0.18.0
+smbus2==0.4.2
