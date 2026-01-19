@@ -1,8 +1,5 @@
 # IPoWDM Kafka‑Based Multi‑Tenant SDN Control Plane
 
-**Coverage window (from your chats): 12‑01‑2026 → 19‑01‑2026 (Europe/Rome).**
-
-This guide is a **comprehensive, implementation‑focused** description of what we have successfully built so far:
 
 - ✅ **Module A — Link Database**: FastAPI service + Redis datastore + Docker deployment + health checks
 - ✅ **Module B — Slice Manager**: FastAPI service implementing **Case 1 (vOp activation)**, Kafka topic provisioning, LinkDB interface reservations, deployment hook
