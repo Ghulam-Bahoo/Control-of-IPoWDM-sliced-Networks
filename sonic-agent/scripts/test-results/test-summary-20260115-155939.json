@@ -1,0 +1,49 @@
+{
+  "total_tests": 7,
+  "passed_tests": 1,
+  "failed_tests": 6,
+  "success_rate": 14.285714285714285,
+  "total_time_seconds": 14.241492986679077,
+  "test_results": {
+    "kafka_connection": {
+      "passed": true,
+      "topics": [
+        0,
+        1,
+        2
+      ]
+    },
+    "health_check": {
+      "passed": false,
+      "error": ""
+    },
+    "interface_status": {
+      "passed": false,
+      "error": ""
+    },
+    "pluggable_info": {
+      "passed": false,
+      "error": ""
+    },
+    "setup_connection": {
+      "passed": false,
+      "error": ""
+    },
+    "telemetry_collection": {
+      "passed": false,
+      "error": ""
+    },
+    "reconfig_connection": {
+      "passed": false,
+      "error": ""
+    }
+  },
+  "timestamp": 1768492779.8973086,
+  "config": {
+    "pop_id": "pop1",
+    "router_id": "router1",
+    "virtual_operator": "vOp2",
+    "kafka_broker": "10.30.7.52:9092",
+    "test_interface": "Ethernet192"
+  }
+}
