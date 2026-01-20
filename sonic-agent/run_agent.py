@@ -66,9 +66,15 @@ def main():
     logger.info("=" * 60)
     
     try:
+        settings.validate_interface_mappings()
+    except Exception:
+        logger.exception("Failed to validate interface mappings")
+    
+    try:
         # Create and run agent
         agent = AgentOrchestrator()
         agent.run()
+        
         
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

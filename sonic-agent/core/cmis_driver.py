@@ -138,9 +138,66 @@ class CMISDriver:
             sfp = self.platform_chassis.get_sfp(port_num)
             return sfp
         except Exception as e:
-            self.logger.error(f"Failed to get SFP for {interface}: {e}")
+            msg = str(e)
+            if "name 'sys' is not defined" in msg:
+                # Known SONiC platform bug path – treat as "no module present"
+                self.logger.debug(
+                    "Platform bug while getting SFP for %s (%s); "
+                    "treating as no module present",
+                    interface,
+                    msg,
+                )
+            else:
+                self.logger.error(f"Failed to get SFP for {interface}: {e}")
             return None
+
     
+    def _read_basic_info(self, sfp) -> Tuple[str, str, str]:
+        """
+        Safely read vendor / part number / serial from an SFP object.
+
+        This tolerates platforms where get_vendor(), get_part_number(), or
+        get_serial() do not exist and returns "unknown" instead of raising.
+        """
+        vendor = "unknown"
+        part_number = "unknown"
+        serial = "unknown"
+
+        if not sfp:
+            return vendor, part_number, serial
+
+        def safe_call(method_name: str) -> Optional[str]:
+            try:
+                fn = getattr(sfp, method_name, None)
+                if not callable(fn):
+                    return None
+                val = fn()
+                if isinstance(val, bytes):
+                    val = val.decode(errors="ignore")
+                if isinstance(val, str):
+                    val = val.strip().strip("\x00")
+                return val or None
+            except Exception as e:
+                # Debug-level: we don't want to spam ERROR on platform quirks
+                self.logger.debug(
+                    "Failed to call %s on SFP object: %s", method_name, e
+                )
+                return None
+
+        v = safe_call("get_vendor")
+        if v:
+            vendor = v
+
+        pn = safe_call("get_part_number")
+        if pn:
+            part_number = pn
+
+        sn = safe_call("get_serial")
+        if sn:
+            serial = sn
+
+        return vendor, part_number, serial
+
     def check_health(self) -> bool:
         """Check health of all interfaces."""
         healthy_count = 0
@@ -150,18 +207,24 @@ class CMISDriver:
                 sfp = self._get_sfp(interface)
                 if not sfp:
                     continue
-                
+
                 if sfp.get_presence():
-                    # Try to read basic info
-                    vendor = sfp.get_vendor()
-                    if vendor:
+                    vendor, part_number, serial = self._read_basic_info(sfp)
+                    if vendor != "unknown":
                         healthy_count += 1
-                        self.logger.debug(f"Interface {interface} healthy: {vendor}")
+                        self.logger.debug(
+                            "Interface %s healthy: vendor=%s, pn=%s, sn=%s",
+                            interface,
+                            vendor,
+                            part_number,
+                            serial,
+                        )
                     else:
-                        self.logger.warning(f"Interface {interface} present but no vendor info")
-                else:
-                    self.logger.warning(f"Interface {interface} not present")
-                    
+                        self.logger.info(
+                            "Interface %s present but vendor info not available on this platform",
+                            interface,
+                        )
+
             except Exception as e:
                 self.logger.error(f"Health check failed for {interface}: {e}")
         
@@ -192,9 +255,10 @@ class CMISDriver:
                 return result
             
             # Get basic info
-            result["vendor"] = sfp.get_vendor() or "unknown"
-            result["part_number"] = sfp.get_part_number() or "unknown"
-            result["serial"] = sfp.get_serial() or "unknown"
+            vendor, part_number, serial = self._read_basic_info(sfp)
+            result["vendor"] = vendor
+            result["part_number"] = part_number
+            result["serial"] = serial
             
             # Read module state
             state = self._read_module_state(sfp)
@@ -288,8 +352,9 @@ class CMISDriver:
                 return capabilities
             
             # Add vendor info
-            capabilities["vendor"] = sfp.get_vendor() or "unknown"
-            capabilities["part_number"] = sfp.get_part_number() or "unknown"
+                vendor, part_number, _ = self._read_basic_info(sfp)
+                capabilities["vendor"] = vendor
+                capabilities["part_number"] = part_number
             
         except Exception as e:
             self.logger.error(f"Failed to get capabilities for {interface}: {e}")

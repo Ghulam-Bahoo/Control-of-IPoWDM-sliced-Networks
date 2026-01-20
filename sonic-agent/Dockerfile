@@ -1,23 +1,34 @@
-FROM python:3.11-slim
+FROM python:3.9-slim
+
+# Work directory inside the container
 WORKDIR /app
 
+# Python runtime settings
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+
+# Make SONiC host Python libs visible inside the container
+# (mounted via docker-compose under /sonic/*)
+ENV PYTHONPATH="/sonic/py3-local:/sonic/py3-dist:/sonic/py3-std:${PYTHONPATH}"
+
+# IMPORTANT: keep container's own libs first, host SONiC libs last
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/lib:/usr/lib/x86_64-linux-gnu:/host-libs/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
 
 # Copy requirements FIRST (better caching)
 COPY requirements.txt .
 
-# INSTALL PACKAGES - with retry and verbose output
+# Install Python dependencies
 RUN echo "Installing Python packages..." && \
     pip install --no-cache-dir -r requirements.txt && \
     echo "Verifying installations..." && \
     python -c "import kafka; print(f'kafka-python: {kafka.__version__}')" && \
     python -c "import pydantic; print(f'pydantic: {pydantic.__version__}')"
 
-# Copy the rest of the application
+# Copy the rest of the application code
 COPY . .
 
-# Create necessary directories
+# Create log directory (mapped in docker-compose)
 RUN mkdir -p /var/log/sonic-agent
 
-CMD ["python", "-m", "core.sonic_agent"]
+# Use the orchestrator-based agent as entrypoint
+CMD ["python3", "run_agent.py"]

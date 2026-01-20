@@ -1,14 +1,21 @@
 """
 Kafka Manager for SONiC Agent
-Production-ready with retry logic and proper error handling
+
+This version matches the expectations of AgentOrchestrator and TelemetryManager:
+- send_monitoring_message()
+- send_health_message()
+- poll_messages()
+- check_connection()
+
+Health messages are sent on the same monitoring topic instead of requiring a
+separate health_<vOp> topic.
 """
 
 import json
 import time
 import logging
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
-from enum import Enum
 
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import NoBrokersAvailable, KafkaError
@@ -59,32 +66,34 @@ class KafkaManager:
         
         for attempt in range(max_retries):
             try:
-                self.logger.info(f"Connecting to Kafka (attempt {attempt + 1}/{max_retries})...")
+                self.logger.info(
+                    f"Connecting to Kafka (attempt {attempt + 1}/{max_retries})."
+                )
                 
                 # Initialize producer
                 self.producer = KafkaProducer(
                     bootstrap_servers=self.broker,
-                    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                    key_serializer=lambda k: k.encode('utf-8') if k else None,
-                    acks='all',
+                    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                    key_serializer=lambda k: k.encode("utf-8") if k else None,
+                    acks="all",
                     retries=3,
                     max_in_flight_requests_per_connection=1,
-                    request_timeout_ms=30000
+                    request_timeout_ms=30000,
                 )
                 
-                # Initialize consumer
+                # Initialize consumer (for config topic)
                 self.consumer = KafkaConsumer(
                     self.config_topic,
                     bootstrap_servers=self.broker,
-                    value_deserializer=lambda v: json.loads(v.decode('utf-8')),
-                    key_deserializer=lambda k: k.decode('utf-8') if k else None,
+                    value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+                    key_deserializer=lambda k: k.decode("utf-8") if k else None,
                     group_id=self.consumer_group,
-                    auto_offset_reset='latest',
+                    auto_offset_reset="latest",
                     enable_auto_commit=False,
                     session_timeout_ms=30000,
                     heartbeat_interval_ms=3000,
                     max_poll_records=10,
-                    max_poll_interval_ms=300000
+                    max_poll_interval_ms=300000,
                 )
                 
                 # Test connection
@@ -93,7 +102,9 @@ class KafkaManager:
                 self.connected = True
                 self.logger.info(f"Connected to Kafka broker: {self.broker}")
                 self.logger.info(f"Subscribed to config topic: {self.config_topic}")
-                self.logger.info(f"Will publish to monitoring topic: {self.monitoring_topic}")
+                self.logger.info(
+                    f"Will publish to monitoring topic: {self.monitoring_topic}"
+                )
                 return
                 
             except NoBrokersAvailable as e:
@@ -102,7 +113,7 @@ class KafkaManager:
                 self.logger.error(f"Kafka connection failed: {e}")
             
             if attempt < max_retries - 1:
-                self.logger.info(f"Retrying in {retry_delay} seconds...")
+                self.logger.info(f"Retrying in {retry_delay} seconds.")
                 time.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
         
@@ -112,19 +123,21 @@ class KafkaManager:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((KafkaError, ConnectionError))
+        retry=retry_if_exception_type((KafkaError, ConnectionError)),
     )
-    def send_message(self, topic: str, value: Dict[str, Any], key: Optional[str] = None) -> bool:
+    def send_message(
+        self, topic: str, value: Dict[str, Any], key: Optional[str] = None
+    ) -> bool:
         """Send a message to Kafka topic."""
         if not self.connected:
-            self.logger.warning("Not connected to Kafka, attempting reconnection...")
+            self.logger.warning("Not connected to Kafka, attempting reconnection.")
             self._reconnect()
         
         try:
             future = self.producer.send(
                 topic=topic,
                 key=key,
-                value=value
+                value=value,
             )
             
             # Wait for acknowledgment
@@ -132,8 +145,8 @@ class KafkaManager:
             
             self.messages_sent += 1
             self.logger.debug(
-                f"Message sent to {topic}[{record_metadata.partition}:{record_metadata.offset}] "
-                f"(key: {key})"
+                f"Message sent to {topic}[{record_metadata.partition}:"
+                f"{record_metadata.offset}] (key: {key})"
             )
             return True
             
@@ -147,12 +160,17 @@ class KafkaManager:
         return self.send_message(self.monitoring_topic, message)
     
     def send_health_message(self, message: Dict[str, Any]) -> bool:
-        """Send health message."""
-        return self.send_message(f"health_{self.monitoring_topic.split('_')[1]}", message)
+        """
+        Send health message.
+
+        NOTE: we intentionally send health on the same monitoring topic
+        instead of requiring a separate health_<vOp> topic.
+        """
+        return self.send_message(self.monitoring_topic, message)
     
     def poll_messages(self, timeout_ms: int = 1000) -> List[KafkaMessage]:
         """Poll messages from config topic."""
-        messages = []
+        messages: List[KafkaMessage] = []
         
         if not self.connected or not self.consumer:
             return messages
@@ -162,19 +180,23 @@ class KafkaManager:
             
             for _, records in batch.items():
                 for record in records:
-                    message = KafkaMessage(
+                    msg = KafkaMessage(
                         topic=record.topic,
                         key=record.key,
                         value=record.value,
-                        timestamp=record.timestamp / 1000.0 if record.timestamp else time.time()
+                        timestamp=record.timestamp / 1000.0
+                        if record.timestamp
+                        else time.time(),
                     )
-                    messages.append(message)
+                    messages.append(msg)
             
             # Commit offsets if we processed messages
             if messages:
                 self.consumer.commit()
                 self.messages_received += len(messages)
-                self.logger.debug(f"Polled {len(messages)} messages from {self.config_topic}")
+                self.logger.debug(
+                    f"Polled {len(messages)} messages from {self.config_topic}"
+                )
             
         except Exception as e:
             self.receive_errors += 1
@@ -201,7 +223,7 @@ class KafkaManager:
     
     def check_connection(self) -> bool:
         """Check Kafka connection status."""
-        if not self.connected:
+        if not self.connected or not self.producer:
             return False
         
         try:
@@ -235,4 +257,7 @@ class KafkaManager:
     
     def __del__(self):
         """Destructor to ensure cleanup."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass

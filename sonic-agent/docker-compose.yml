@@ -1,10 +1,16 @@
 version: '3.8'
+
 services:
   sonic-agent:
-    # build: .
-    image: sonic-agent:latest 
+    build:
+      context: .
+      # Use host network during IMAGE BUILD (for pip, apt, etc.)
+      network: host
+    image: sonic-agent:latest
     container_name: sonic-agent-${POP_ID}-${ROUTER_ID}
     restart: unless-stopped
+
+    # Runtime networking / privileges
     network_mode: host
     privileged: true
     pid: host
@@ -30,6 +36,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       DEBUG_MODE: ${DEBUG_MODE}
 
+      # Make host SONiC libs visible to python (for libswsscommon, etc.)
+      LD_LIBRARY_PATH: "/host-libs/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+
     volumes:
       # SONiC system access
       - /etc/sonic:/etc/sonic:ro
@@ -47,9 +56,13 @@ services:
       - ./logs:/app/logs:rw
       - /var/log/sonic-agent:/var/log/sonic-agent:rw
 
-      # SONiC Python libraries
-      - /usr/lib/python3.7/dist-packages:/usr/lib/python3.7/dist-packages:ro
-      - /usr/local/lib/python3.7/dist-packages:/usr/local/lib/python3.7/dist-packages:ro
+      # SONiC Python libraries from host (mounted under /sonic inside container)
+      - /usr/local/lib/python3.9/dist-packages:/sonic/py3-local:ro
+      - /usr/lib/python3/dist-packages:/sonic/py3-dist:ro
+      - /usr/lib/python3.9/dist-packages:/sonic/py3-std:ro
+
+      # Native SONiC shared libs (for libswsscommon.so.0, etc.)
+      - /usr/lib/x86_64-linux-gnu:/host-libs/x86_64-linux-gnu:ro
 
     logging:
       driver: "json-file"
@@ -63,4 +76,3 @@ services:
           memory: 256M
         reservations:
           memory: 128M
-
