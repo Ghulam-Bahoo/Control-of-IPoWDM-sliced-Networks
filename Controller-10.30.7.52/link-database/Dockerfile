@@ -1,4 +1,3 @@
-# Dockerfile for Link Database
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -6,22 +5,23 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python packages
+# Copy requirements first (for caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY link_database/ ./link_database/
+COPY . .
 
 # Create non-root user
-RUN useradd -m -u 1000 linkdb && \
-    chown -R linkdb:linkdb /app
-USER linkdb
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
+USER appuser
 
 # Expose port
 EXPOSE 8000
 
 # Run application
-CMD ["uvicorn", "link_database.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "link_database.main:app", "--host", "0.0.0.0", "--port", "8000"]

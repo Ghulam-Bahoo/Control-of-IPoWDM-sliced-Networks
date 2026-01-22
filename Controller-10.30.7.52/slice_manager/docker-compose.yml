@@ -1,0 +1,49 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  slice-manager:
+    build: .
+    container_name: slice-manager
+    restart: unless-stopped
+    ports:
+      - "8082:8080"  # Host:Container - Changed from 8080 to 8082
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8080  # Container internal port stays 8080
+      - KAFKA_BROKER=10.30.7.52:9092
+      - LINKDB_HOST=host.docker.internal
+      - LINKDB_PORT=6379
+
+      - CONTROLLER_DEPLOY_SCRIPT=/app/scripts/deploy-controller.sh
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./scripts/deploy-controller.sh:/app/scripts/deploy-controller.sh:ro
+      - slice-data:/app/data
+    networks:
+      - sdn-control-net
+
+  akhq:
+    image: tchiotludo/akhq
+    container_name: akhq-slice-manager
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            kafka:
+              properties:
+                bootstrap.servers: "10.30.7.52:9092"
+    networks:
+      - sdn-control-net
+
+volumes:
+  slice-data:
+
+networks:
+  sdn-control-net:
+    driver: bridge

@@ -1,481 +1,315 @@
+# core/kafka_manager.py
 """
 Kafka Manager for IP SDN Controller
-Handles communication with SONiC agents via Kafka topics
+
+Controller responsibilities:
+- Produce commands to config_<vOp> (targeted to specific agent_id via key)
+- Consume monitoring_<vOp> to learn:
+    - agent health/heartbeats
+    - telemetry updates
+    - command acknowledgements
+- Provide callbacks for higher layers:
+    - register_heartbeat_callback(fn)
+    - register_telemetry_callback(fn)
+    - register_ack_callback(fn)
 """
 
 import json
-import logging
-from typing import Dict, List, Optional, Any, Callable
-from datetime import datetime
-from dataclasses import dataclass, field
-from enum import Enum
-import threading
 import time
-import uuid
+import logging
+import threading
+from typing import Any, Callable, Dict, List, Optional
 
-from kafka import KafkaProducer, KafkaConsumer, KafkaAdminClient
-from kafka.admin import NewTopic
+from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import KafkaError, NoBrokersAvailable
 
 from config.settings import settings
-from models.schemas import (
-    AgentCommand, SetupConnectionCommand, ReconfigConnectionCommand,
-    InterfaceControlCommand, QoTelemetry
-)
-
 
 logger = logging.getLogger(__name__)
 
-
-class DateTimeEncoder(json.JSONEncoder):
-    """Custom JSON encoder for datetime objects."""
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
+HeartbeatCallback = Callable[[str, str, Dict[str, Any]], None]   # (agent_id, status, message)
+TelemetryCallback = Callable[[str, Dict[str, Any]], None]        # (agent_id, telemetry_message)
+AckCallback = Callable[[str, str, str, Dict[str, Any]], None]    # (command_id, status, agent_id, message)
 
 
-class KafkaMessageType(str, Enum):
-    """Types of Kafka messages."""
-    COMMAND = "COMMAND"
-    TELEMETRY = "TELEMETRY"
-    HEARTBEAT = "HEARTBEAT"
-    ACKNOWLEDGEMENT = "ACKNOWLEDGEMENT"
-    ERROR = "ERROR"
-
-
-@dataclass
-class KafkaMessage:
-    """Standard Kafka message format."""
-    message_id: str
-    message_type: KafkaMessageType
-    sender_id: str
-    recipient_id: Optional[str] = None
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    payload: Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+def uuid4_str() -> str:
+    import uuid
+    return str(uuid.uuid4())
 
 
 class KafkaManager:
-    """
-    Manages Kafka communication with SONiC agents.
-    Handles both command publishing and telemetry consumption.
-    """
-    
     def __init__(self):
-        """Initialize Kafka manager with configuration from settings."""
+        self.vop = settings.VIRTUAL_OPERATOR
         self.broker = settings.KAFKA_BROKER
-        self.config_topic = settings.CONFIG_TOPIC
-        self.monitoring_topic = settings.MONITORING_TOPIC
-        self.controller_id = settings.CONTROLLER_ID
-        self.virtual_operator = settings.VIRTUAL_OPERATOR
-        
-        self.producer = None
-        self.consumer = None
-        self.admin_client = None
-        
-        self._producer_lock = threading.Lock()
-        self._consumer_lock = threading.Lock()
-        
-        self.telemetry_callbacks = []
-        self.heartbeat_callbacks = []
-        self.ack_callbacks = []
-        
-        self._running = False
-        self._consumer_thread = None
-        
-        self._initialize_kafka()
-    
-    def _initialize_kafka(self) -> None:
-        """Initialize Kafka connections and ensure topics exist."""
+
+        self.config_topic = settings.CONFIG_TOPIC          # e.g., config_vOp2
+        self.monitoring_topic = settings.MONITORING_TOPIC  # e.g., monitoring_vOp2
+
+        self._producer: Optional[KafkaProducer] = None
+        self._consumer: Optional[KafkaConsumer] = None
+
+        self._consume_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+        self._heartbeat_callbacks: List[HeartbeatCallback] = []
+        self._telemetry_callbacks: List[TelemetryCallback] = []
+        self._ack_callbacks: List[AckCallback] = []
+
+        self._init_clients()
+
+        logger.info("Kafka manager initialized for %s", self.vop)
+        logger.info("Config topic: %s", self.config_topic)
+        logger.info("Monitoring topic: %s", self.monitoring_topic)
+
+    # ---------------------------
+    # Public callback registration
+    # ---------------------------
+    def register_heartbeat_callback(self, cb: HeartbeatCallback) -> None:
+        self._heartbeat_callbacks.append(cb)
+
+    def register_telemetry_callback(self, cb: TelemetryCallback) -> None:
+        self._telemetry_callbacks.append(cb)
+
+    def register_ack_callback(self, cb: AckCallback) -> None:
+        self._ack_callbacks.append(cb)
+
+    # ---------------------------
+    # Init / lifecycle
+    # ---------------------------
+    def _init_clients(self) -> None:
         try:
-            # Initialize admin client for topic management
-            self.admin_client = KafkaAdminClient(
+            self._producer = KafkaProducer(
                 bootstrap_servers=self.broker,
-                client_id=f"{self.controller_id}_admin"
-            )
-            
-            # Ensure topics exist
-            self._ensure_topics()
-            
-            # Initialize producer
-            self.producer = KafkaProducer(
-                bootstrap_servers=self.broker,
-                client_id=self.controller_id,
-                value_serializer=lambda v: json.dumps(v, cls=DateTimeEncoder).encode('utf-8'),
-                key_serializer=lambda k: k.encode('utf-8') if k else None,
-                acks='all',  # Wait for all replicas to acknowledge
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else None,
+                acks="all",
                 retries=3,
+                linger_ms=10,
+                request_timeout_ms=30000,
                 max_in_flight_requests_per_connection=1,
-                request_timeout_ms=30000
             )
-            
-            # Initialize consumer for telemetry
-            self.consumer = KafkaConsumer(
+
+            # Controller consumes monitoring topic to track agents and telemetry
+            self._consumer = KafkaConsumer(
                 self.monitoring_topic,
                 bootstrap_servers=self.broker,
-                client_id=f"{self.controller_id}_consumer",
-                group_id=f"{self.virtual_operator}_controller",
-                value_deserializer=lambda v: json.loads(v.decode('utf-8')),
-                key_deserializer=lambda k: k.decode('utf-8') if k else None,
-                auto_offset_reset='latest',
+                value_deserializer=lambda v: json.loads(v.decode("utf-8", errors="ignore")),
+                key_deserializer=lambda k: k.decode("utf-8", errors="ignore") if k else None,
+                group_id=f"controller-{self.vop}",
+                auto_offset_reset="latest",
                 enable_auto_commit=True,
-                auto_commit_interval_ms=5000,
                 session_timeout_ms=30000,
-                heartbeat_interval_ms=10000
+                heartbeat_interval_ms=3000,
+                max_poll_records=100,
+                max_poll_interval_ms=300000,
             )
-            
-            logger.info(f"Kafka manager initialized for {self.virtual_operator}")
-            logger.info(f"Config topic: {self.config_topic}")
-            logger.info(f"Monitoring topic: {self.monitoring_topic}")
-            
+
         except NoBrokersAvailable as e:
-            logger.error(f"No Kafka brokers available at {self.broker}: {e}")
+            logger.error("Kafka broker not available: %s", e)
             raise
         except Exception as e:
-            logger.error(f"Failed to initialize Kafka manager: {e}")
+            logger.error("Kafka init failed: %s", e)
             raise
-    
-    def _ensure_topics(self) -> None:
-        """Ensure required Kafka topics exist, create if missing."""
-        try:
-            existing_topics = self.admin_client.list_topics()
-            topics_to_create = []
-            
-            if self.config_topic not in existing_topics:
-                topics_to_create.append(
-                    NewTopic(
-                        name=self.config_topic,
-                        num_partitions=3,
-                        replication_factor=1
-                    )
-                )
-                logger.info(f"Will create config topic: {self.config_topic}")
-            
-            if self.monitoring_topic not in existing_topics:
-                topics_to_create.append(
-                    NewTopic(
-                        name=self.monitoring_topic,
-                        num_partitions=3,
-                        replication_factor=1
-                    )
-                )
-                logger.info(f"Will create monitoring topic: {self.monitoring_topic}")
-            
-            if topics_to_create:
-                self.admin_client.create_topics(new_topics=topics_to_create, validate_only=False)
-                logger.info(f"Created topics: {[t.name for t in topics_to_create]}")
-                # Wait a bit for topics to be fully created
-                time.sleep(2)
-            
-        except Exception as e:
-            logger.error(f"Failed to ensure topics exist: {e}")
-            # Don't raise - we can continue if topics already exist
-    
+
     def start_consuming(self) -> None:
-        """Start consuming messages from monitoring topic."""
-        if self._running:
-            logger.warning("Consumer is already running")
+        if self._consume_thread and self._consume_thread.is_alive():
             return
-        
-        self._running = True
-        self._consumer_thread = threading.Thread(
-            target=self._consume_messages,
-            name="KafkaConsumerThread",
-            daemon=True
+
+        self._stop_event.clear()
+        self._consume_thread = threading.Thread(
+            target=self._consume_loop,
+            name="KafkaConsumeThread",
+            daemon=True,
         )
-        self._consumer_thread.start()
-        logger.info("Started Kafka consumer thread")
-    
+        self._consume_thread.start()
+
     def stop_consuming(self) -> None:
-        """Stop consuming messages."""
-        self._running = False
-        if self._consumer_thread:
-            self._consumer_thread.join(timeout=10)
-            logger.info("Stopped Kafka consumer thread")
-    
-    def _consume_messages(self) -> None:
-        """Main consumer loop for processing incoming messages."""
-        logger.info(f"Starting to consume from {self.monitoring_topic}")
-        
-        while self._running:
-            try:
-                # Poll for messages with timeout
-                message_batch = self.consumer.poll(timeout_ms=1000)
-                
-                for topic_partition, messages in message_batch.items():
-                    for message in messages:
-                        self._process_message(message)
-                
-            except Exception as e:
-                logger.error(f"Error in consumer loop: {e}")
-                if self._running:
-                    time.sleep(1)  # Avoid tight loop on error
-    
-    def _process_message(self, message) -> None:
-        """Process a single Kafka message."""
-        try:
-            if not message.value:
-                logger.warning("Received empty message")
-                return
-            
-            message_data = message.value
-            
-            # Extract message type
-            msg_type = message_data.get('message_type')
-            sender_id = message_data.get('sender_id')
-            
-            logger.debug(f"Received {msg_type} message from {sender_id}")
-            
-            # Route based on message type
-            if msg_type == KafkaMessageType.TELEMETRY.value:
-                self._handle_telemetry(message_data)
-            elif msg_type == KafkaMessageType.HEARTBEAT.value:
-                self._handle_heartbeat(message_data)
-            elif msg_type == KafkaMessageType.ACKNOWLEDGEMENT.value:
-                self._handle_acknowledgement(message_data)
-            elif msg_type == KafkaMessageType.ERROR.value:
-                self._handle_error(message_data)
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
-                
-        except Exception as e:
-            logger.error(f"Failed to process message: {e}")
-    
-    def _handle_telemetry(self, message_data: Dict[str, Any]) -> None:
-        """Handle telemetry messages from agents."""
-        try:
-            # Convert to QoTelemetry model
-            telemetry = QoTelemetry(**message_data.get('payload', {}))
-            
-            # Notify registered callbacks
-            for callback in self.telemetry_callbacks:
-                try:
-                    callback(telemetry)
-                except Exception as e:
-                    logger.error(f"Telemetry callback error: {e}")
-            
-            logger.debug(f"Processed telemetry for connection {telemetry.connection_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to handle telemetry: {e}")
-    
-    def _handle_heartbeat(self, message_data: Dict[str, Any]) -> None:
-        """Handle heartbeat messages from agents."""
-        try:
-            agent_id = message_data.get('sender_id')
-            status = message_data.get('payload', {}).get('status', 'UNKNOWN')
-            
-            # Notify registered callbacks
-            for callback in self.heartbeat_callbacks:
-                try:
-                    callback(agent_id, status, message_data)
-                except Exception as e:
-                    logger.error(f"Heartbeat callback error: {e}")
-            
-            logger.debug(f"Heartbeat from {agent_id}: {status}")
-            
-        except Exception as e:
-            logger.error(f"Failed to handle heartbeat: {e}")
-    
-    def _handle_acknowledgement(self, message_data: Dict[str, Any]) -> None:
-        """Handle acknowledgement messages from agents."""
-        try:
-            command_id = message_data.get('payload', {}).get('command_id')
-            status = message_data.get('payload', {}).get('status', 'UNKNOWN')
-            agent_id = message_data.get('sender_id')
-            
-            # Notify registered callbacks
-            for callback in self.ack_callbacks:
-                try:
-                    callback(command_id, status, agent_id, message_data)
-                except Exception as e:
-                    logger.error(f"ACK callback error: {e}")
-            
-            logger.info(f"ACK from {agent_id} for command {command_id}: {status}")
-            
-        except Exception as e:
-            logger.error(f"Failed to handle acknowledgement: {e}")
-    
-    def _handle_error(self, message_data: Dict[str, Any]) -> None:
-        """Handle error messages from agents."""
-        try:
-            agent_id = message_data.get('sender_id')
-            error_details = message_data.get('payload', {})
-            
-            logger.error(f"Error from agent {agent_id}: {error_details}")
-            
-            # Could trigger alerting or recovery actions here
-            
-        except Exception as e:
-            logger.error(f"Failed to handle error message: {e}")
-    
-    def send_command(self, command: AgentCommand, target_agent: Optional[str] = None) -> bool:
-        """
-        Send a command to agents via Kafka.
-        
-        Args:
-            command: The agent command to send
-            target_agent: Specific agent ID (None for broadcast)
-            
-        Returns:
-            True if sent successfully
-        """
-        try:
-            # Create Kafka message
-            kafka_message = KafkaMessage(
-                message_id=str(uuid.uuid4()),
-                message_type=KafkaMessageType.COMMAND,
-                sender_id=self.controller_id,
-                recipient_id=target_agent,
-                payload=command.dict()
-            )
-            
-            # Convert to dict
-            message_dict = {
-                'message_id': kafka_message.message_id,
-                'message_type': kafka_message.message_type.value,
-                'sender_id': kafka_message.sender_id,
-                'recipient_id': kafka_message.recipient_id,
-                'timestamp': kafka_message.timestamp.isoformat(),
-                'payload': kafka_message.payload,
-                'metadata': kafka_message.metadata
-            }
-            
-            # Send to config topic
-            future = self.producer.send(
-                topic=self.config_topic,
-                value=message_dict,
-                key=target_agent  # Partition by agent ID
-            )
-            
-            # Wait for send confirmation
-            record_metadata = future.get(timeout=10)
-            
-            logger.info(
-                f"Command {command.action} sent to {target_agent or 'all agents'}. "
-                f"Topic: {record_metadata.topic}, "
-                f"Partition: {record_metadata.partition}, "
-                f"Offset: {record_metadata.offset}"
-            )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to send command {command.action}: {e}")
-            return False
-    
-    def send_setup_command(self, connection_id: str, params: Dict[str, Any],
-                          target_agent: Optional[str] = None) -> bool:
-        """Send connection setup command."""
-        command = SetupConnectionCommand(
-            command_id=str(uuid.uuid4()),
-            target_pop=params.get('pop_id'),
-            parameters={
-                'connection_id': connection_id,
-                'params': params,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        return self.send_command(command, target_agent)
-    
-    def send_reconfig_command(self, connection_id: str, reason: str,
-                             params: Dict[str, Any], target_agent: Optional[str] = None) -> bool:
-        """Send reconfiguration command."""
-        command = ReconfigConnectionCommand(
-            command_id=str(uuid.uuid4()),
-            target_pop=params.get('pop_id'),
-            parameters={
-                'connection_id': connection_id,
-                'reason': reason,
-                'params': params,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        return self.send_command(command, target_agent)
-    
-    def send_interface_command(self, action: str, interface_params: Dict[str, Any],
-                              target_agent: Optional[str] = None) -> bool:
-        """Send interface control command."""
-        command = InterfaceControlCommand(
-            command_id=str(uuid.uuid4()),
-            target_pop=interface_params.get('pop_id'),
-            parameters={
-                'action': action,
-                'params': interface_params,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        return self.send_command(command, target_agent)
-    
-    def register_telemetry_callback(self, callback: Callable[[QoTelemetry], None]) -> None:
-        """Register callback for telemetry messages."""
-        self.telemetry_callbacks.append(callback)
-        logger.debug(f"Registered telemetry callback: {callback.__name__}")
-    
-    def register_heartbeat_callback(self, callback: Callable[[str, str, Dict], None]) -> None:
-        """Register callback for heartbeat messages."""
-        self.heartbeat_callbacks.append(callback)
-        logger.debug(f"Registered heartbeat callback: {callback.__name__}")
-    
-    def register_ack_callback(self, callback: Callable[[str, str, str, Dict], None]) -> None:
-        """Register callback for acknowledgement messages."""
-        self.ack_callbacks.append(callback)
-        logger.debug(f"Registered ACK callback: {callback.__name__}")
-    
-    def health_check(self) -> Dict[str, Any]:
-        """Check Kafka connection health."""
-        try:
-            # Check producer
-            producer_ok = self.producer is not None
-            
-            # Check consumer
-            consumer_ok = self.consumer is not None and self._running
-            
-            # Try to list topics as connectivity test
-            topics_ok = False
-            if self.admin_client:
-                topics = self.admin_client.list_topics()
-                topics_ok = self.config_topic in topics and self.monitoring_topic in topics
-            
-            return {
-                'status': 'healthy' if all([producer_ok, consumer_ok, topics_ok]) else 'degraded',
-                'producer_connected': producer_ok,
-                'consumer_running': consumer_ok,
-                'topics_available': topics_ok,
-                'config_topic': self.config_topic,
-                'monitoring_topic': self.monitoring_topic,
-                'broker': self.broker,
-                'timestamp': datetime.utcnow().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"Kafka health check failed: {e}")
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'timestamp': datetime.utcnow().isoformat()
-            }
-    
+        self._stop_event.set()
+        if self._consume_thread and self._consume_thread.is_alive():
+            self._consume_thread.join(timeout=5)
+
     def close(self) -> None:
-        """Clean up Kafka connections."""
         self.stop_consuming()
-        
-        if self.producer:
-            self.producer.flush(timeout=10)
-            self.producer.close()
-            logger.info("Kafka producer closed")
-        
-        if self.consumer:
-            self.consumer.close()
-            logger.info("Kafka consumer closed")
-        
-        if self.admin_client:
-            self.admin_client.close()
-            logger.info("Kafka admin client closed")
-        
+
+        try:
+            if self._producer:
+                self._producer.flush(timeout=5)
+                self._producer.close(timeout=5)
+                logger.info("Kafka producer closed")
+        except Exception:
+            pass
+
+        try:
+            if self._consumer:
+                self._consumer.close()
+                logger.info("Kafka consumer closed")
+        except Exception:
+            pass
+
         logger.info("Kafka manager shutdown complete")
-    
-    def __del__(self):
-        """Destructor for cleanup."""
-        self.close()
+
+    # ---------------------------
+    # Consume loop
+    # ---------------------------
+    def _consume_loop(self) -> None:
+        if not self._consumer:
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                records = self._consumer.poll(timeout_ms=1000)
+                for _tp, recs in (records or {}).items():
+                    for r in recs:
+                        msg = getattr(r, "value", None)
+                        if isinstance(msg, dict):
+                            self._route_monitoring_message(msg)
+            except Exception as e:
+                logger.warning("Kafka consume loop error: %s", e)
+                time.sleep(1)
+
+    def _route_monitoring_message(self, msg: Dict[str, Any]) -> None:
+        """
+        Accepts:
+        - Health:
+            {"type":"agentHealth","agent_id":"pop1-router1","status":"healthy",...}
+          or older:
+            {"type":"heartbeat","payload":{...}}
+        - Telemetry:
+            {"type":"telemetry","agent_id":"...","data":{...},...}
+        - ACK:
+            {"type":"commandAck","agent_id":"...","command_id":"...","status":"ok",...}
+        """
+        mtype = msg.get("type") or msg.get("message_type")
+        if not mtype:
+            logger.warning("Unknown message type: %s", msg.get("type"))
+            return
+
+        agent_id = msg.get("agent_id") or msg.get("payload", {}).get("agent_id") or "unknown"
+
+        # ---- Health / Heartbeat ----
+        if mtype in ("agentHealth", "agentHeartbeat", "health", "heartbeat"):
+            status_raw = msg.get("status") or msg.get("payload", {}).get("status") or "unknown"
+            norm = "HEALTHY"
+            if isinstance(status_raw, str) and status_raw.lower() not in ("healthy", "ok", "up"):
+                norm = "DEGRADED"
+
+            envelope = {"payload": msg}
+            for cb in self._heartbeat_callbacks:
+                try:
+                    cb(agent_id, norm, envelope)
+                except Exception as e:
+                    logger.debug("Heartbeat callback failed: %s", e)
+            return
+
+        # ---- Telemetry ----
+        if mtype in ("telemetry", "agentTelemetry", "monitoring", "qotTelemetry"):
+            # Pass the full message upstream (QoT monitor can interpret fields)
+            for cb in self._telemetry_callbacks:
+                try:
+                    cb(agent_id, msg)
+                except Exception as e:
+                    logger.debug("Telemetry callback failed: %s", e)
+            return
+
+        # ---- ACK ----
+        if mtype in ("commandAck", "ack", "command_ack"):
+            command_id = msg.get("command_id") or msg.get("payload", {}).get("command_id") or "unknown"
+            ack_status = msg.get("ack_status") or msg.get("status") or msg.get("payload", {}).get("status") or "unknown"
+
+            for cb in self._ack_callbacks:
+                try:
+                    cb(str(command_id), str(ack_status), str(agent_id), msg)
+                except Exception as e:
+                    logger.debug("Ack callback failed: %s", e)
+            return
+
+        # Ignore other monitoring events safely
+        return
+
+    # ---------------------------
+    # Produce commands (controller -> agent)
+    # ---------------------------
+    def _send(self, topic: str, key: Optional[str], value: Dict[str, Any]) -> bool:
+        if not self._producer:
+            return False
+        try:
+            fut = self._producer.send(topic=topic, key=key, value=value)
+            fut.get(timeout=10)
+            return True
+        except KafkaError as e:
+            logger.error("Kafka send failed: %s", e)
+            return False
+        except Exception as e:
+            logger.error("Kafka send failed: %s", e)
+            return False
+
+    def send_command(self, command: Any, target_agent: Optional[str]) -> bool:
+        if isinstance(command, dict):
+            payload = command
+        elif hasattr(command, "dict"):
+            payload = command.dict()
+        elif hasattr(command, "__dict__"):
+            payload = dict(command.__dict__)
+        else:
+            payload = {"command": str(command)}
+
+        return self._send(self.config_topic, target_agent, payload)
+
+    def send_interface_command(self, action: str, interface_params: Dict[str, Any], target_agent: str) -> bool:
+        msg = {
+            "type": "interfaceControl",
+            "command_id": uuid4_str(),
+            "timestamp": time.time(),
+            "target_agent": target_agent,
+            "action": action,
+            "parameters": interface_params,
+        }
+        return self._send(self.config_topic, target_agent, msg)
+
+    def send_setup_command(self, connection_id: str, params: Dict[str, Any], target_agent: str) -> bool:
+        msg = {
+            "type": "setupConnection",
+            "command_id": uuid4_str(),
+            "timestamp": time.time(),
+            "target_agent": target_agent,
+            "connection_id": connection_id,
+            "parameters": params,
+        }
+        return self._send(self.config_topic, target_agent, msg)
+
+    def send_reconfig_command(self, connection_id: str, reason: str, params: Dict[str, Any], target_agent: str) -> bool:
+        msg = {
+            "type": "reconfigConnection",
+            "command_id": uuid4_str(),
+            "timestamp": time.time(),
+            "target_agent": target_agent,
+            "connection_id": connection_id,
+            "reason": reason,
+            "parameters": params,
+        }
+        return self._send(self.config_topic, target_agent, msg)
+
+    # ---------------------------
+    # Health
+    # ---------------------------
+    def health_check(self) -> Dict[str, Any]:
+        ok = True
+        err = None
+        try:
+            if self._producer:
+                _ = self._producer.partitions_for(self.config_topic)
+            if self._consumer:
+                _ = self._consumer.subscription()
+        except Exception as e:
+            ok = False
+            err = str(e)
+
+        return {
+            "status": "healthy" if ok else "unhealthy",
+            "broker": self.broker,
+            "config_topic": self.config_topic,
+            "monitoring_topic": self.monitoring_topic,
+            "error": err,
+            "timestamp": time.time(),
+        }
+

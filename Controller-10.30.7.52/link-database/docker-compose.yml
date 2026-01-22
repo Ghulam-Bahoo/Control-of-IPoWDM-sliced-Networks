@@ -1,39 +1,70 @@
-# docker-compose.yml for Link Database
+# docker-compose.yml - FIXED VERSION
 version: '3.8'
 
 services:
   link-database:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: link-database:latest
     container_name: link-database
+    hostname: link-database
     ports:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379
       - KAFKA_BROKER=10.30.7.52:9092
       - LOG_LEVEL=INFO
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - ipowdm-network
-    volumes:
-      - ./link_database:/app/link_database  # For development: mount local code
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s = socket.socket(); s.settimeout(2); result = s.connect_ex(('localhost', 8000)); s.close(); exit(0 if result == 0 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7-alpine
     container_name: link-db-redis
+    hostname: redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --requirepass ""  # No password for dev
     restart: unless-stopped
     networks:
       - ipowdm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   redis-data:
+    driver: local
 
 networks:
   ipowdm-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.10.0/24

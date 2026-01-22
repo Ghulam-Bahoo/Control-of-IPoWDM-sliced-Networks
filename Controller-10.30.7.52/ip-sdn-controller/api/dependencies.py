@@ -6,7 +6,6 @@ from typing import Generator
 import logging
 
 from fastapi import Depends, HTTPException, status
-from sqlalchemy.orm import Session
 
 from config.settings import settings
 from core.linkdb_client import LinkDBClient
