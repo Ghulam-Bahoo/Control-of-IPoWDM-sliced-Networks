@@ -4,7 +4,7 @@ services:
   sonic-agent:
     build:
       context: .
-      # Use host network during IMAGE BUILD (for pip, apt, etc.)
+      # Use host network during IMAGE BUILD (for pip, etc.)
       network: host
     image: sonic-agent:latest
     container_name: sonic-agent-${POP_ID}-${ROUTER_ID}
@@ -36,8 +36,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL}
       DEBUG_MODE: ${DEBUG_MODE}
 
-      # Make host SONiC libs visible to python (for libswsscommon, etc.)
-      LD_LIBRARY_PATH: "/host-libs/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+      # NOTE: LD_LIBRARY_PATH is now set in the Dockerfile, not here,
+      # to avoid overriding libc with host GLIBC.
 
     volumes:
       # SONiC system access
@@ -76,3 +76,4 @@ services:
           memory: 256M
         reservations:
           memory: 128M
+

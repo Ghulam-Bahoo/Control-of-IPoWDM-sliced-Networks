@@ -94,32 +94,30 @@ class QoTEvent(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Health messages
+# Health messages (used by AgentOrchestrator)
 # ---------------------------------------------------------------------------
 
-class HealthStatus(str, Enum):
-    HEALTHY = "healthy"
-    DEGRADED = "degraded"
-    UNHEALTHY = "unhealthy"
-
-
-class AgentHealth(BaseModel):
-    """Health summary for the agent."""
+class HealthStatus(BaseModel):
+    """Health summary for the agent, as sent by AgentOrchestrator."""
     model_config = ConfigDict(extra="ignore")
 
     type: str = Field("agentHealth", description="Message type discriminator")
     agent_id: str
-    status: HealthStatus
-    details: Dict[str, Any] = Field(default_factory=dict)
+    status: str  # "healthy", "degraded", "stopped", "error", etc.
+    pop_id: str
+    router_id: str
+    uptime: float = 0.0
+    interfaces: List[Dict[str, Any]] = Field(default_factory=list)
+    issues: List[str] = Field(default_factory=list)
     timestamp: float = Field(default_factory=lambda: time.time())
 
 
 # ---------------------------------------------------------------------------
-# Commands from controller -> agent
+# Commands from controller -> agent (generic)
 # ---------------------------------------------------------------------------
 
 class AgentCommandType(str, Enum):
-    """Supported command types from IP-SDN controller."""
+    """Supported generic command types."""
     HEALTH_CHECK = "healthCheck"
     START_TELEMETRY = "startTelemetry"
     STOP_TELEMETRY = "stopTelemetry"
@@ -129,18 +127,7 @@ class AgentCommandType(str, Enum):
 
 class AgentCommand(BaseModel):
     """
-    Command issued by the controller to the agent, over `config_<vOp>` topic.
-
-    Example payload:
-    {
-        "command_id": "cmd-123",
-        "type": "startTelemetry",
-        "parameters": {
-            "connection_id": "conn-1",
-            "interface": "Ethernet192"
-        },
-        "timestamp": 1700000000.0
-    }
+    Generic command issued by the controller to the agent, over `config_<vOp>` topic.
     """
     model_config = ConfigDict(extra="ignore")
 
@@ -151,3 +138,48 @@ class AgentCommand(BaseModel):
         description="Command-specific parameters"
     )
     timestamp: float = Field(default_factory=lambda: time.time())
+
+
+# ---------------------------------------------------------------------------
+# Capabilities and connection setup (used by AgentOrchestrator)
+# ---------------------------------------------------------------------------
+
+class AgentCapabilities(BaseModel):
+    """Capabilities of the agent and its interfaces (Fig. 2a style)."""
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = Field("agentCapabilities", description="Message type discriminator")
+    agent_id: str
+    pop_id: str
+    node_id: str
+    interfaces: List[Dict[str, Any]] = Field(default_factory=list)
+    timestamp: float = Field(default_factory=lambda: time.time())
+
+
+class SetupConnectionCommand(BaseModel):
+    """Command for setting up a connection (Case 2 from the OFC paper)."""
+    model_config = ConfigDict(extra="ignore")
+
+    command_id: Optional[str] = Field(default=None, description="Command identifier")
+    type: Optional[str] = Field(default=None, description="Message type, e.g. 'command'")
+    action: str = Field(..., description="Expected to be 'setupConnection'")
+    connection_id: str = Field(..., description="Logical connection ID")
+    endpoint_config: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Per-endpoint configuration dicts (pop_id, node_id, port_id, app, tx_power_level, ...)"
+    )
+    frequency: float = Field(..., description="Optical frequency for the connection")
+    timestamp: float = Field(default_factory=lambda: time.time())
+
+
+class ErrorReport(BaseModel):
+    """Error report sent when message / command processing fails."""
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = Field("error", description="Message type discriminator")
+    agent_id: str
+    error_type: str
+    error_message: str
+    command_id: Optional[str] = None
+    timestamp: float = Field(default_factory=lambda: time.time())
+

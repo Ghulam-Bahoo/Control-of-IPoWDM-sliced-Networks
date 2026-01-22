@@ -193,3 +193,4 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+

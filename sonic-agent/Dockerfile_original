@@ -24,10 +24,6 @@ RUN echo "Installing Python packages..." && \
     python -c "import kafka; print(f'kafka-python: {kafka.__version__}')" && \
     python -c "import pydantic; print(f'pydantic: {pydantic.__version__}')"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 \
- && rm -rf /var/lib/apt/lists/*
-
 # Copy the rest of the application code
 COPY . .
 
